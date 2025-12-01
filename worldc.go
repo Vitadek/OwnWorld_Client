@@ -1,226 +1,223 @@
+package main
 
 import (
-        "encoding/json"
-        "fmt"
-        "io/ioutil"
-        "os"
-        "sync"
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 )
 
-type GameState struct {
-        FoodCount      int                 `json:"food"`
-        WaterCount     int                 `json:"water"`
-        MineralCount   int                 `json:"minerals"`
-        Population     int                 `json:"population"`
-        Happiness      float64             `json:"happiness"`
-        ResearchPoints int                 `json:"researchPoints"`
-        Infra          map[string]int      `json:"infrastructure"`
-        TicksPassed    int                 `json:"ticksPassed"`
-        StarCoins      int                 `json:"starCoins"`
-        TaxRate        float64             `json:"taxRate"`
-        Ships          map[string][]*Ship  `json:"ships"`
+// --- Structs ---
+
+type Colony struct {
+	ID        int            `json:"id"`
+	Name      string         `json:"name"`
+	Location  []int          `json:"location"`
+	Buildings map[string]int `json:"buildings"`
+	Food      int            `json:"food"`
+	Water     int            `json:"water"`
+	Pop       int            `json:"population"`
 }
 
-type Ship struct {
-        Name             string  `json:"name"`
-        Class            string  `json:"Class"`
-        Health           int     `json:"Health"`
-        Description      string  `json:"Description"`
-        PersonnelLimit   int     `json:"Personnel_Limit"`
-        PersonnelMinimum int     `json:"Personnel_Minimum"`
-        CargoLimit       int     `json:"Cargo_Limit"`
-        FuelCapacity     int     `json:"Fuel_Capacity"`
-        FuelEfficiency   float64 `json:"Fuel_Efficiency"`
-        Level            int     `json:"Level"`
-        Damage           int     `json:"Damage"`
-        Price            int     `json:"Price"`
-        Amount           int     `json:"Amount"`
+type ColonySummary struct {
+	Name      string `json:"name"`
+	OwnerName string `json:"owner_name"`
+	Location  []int  `json:"location"`
 }
 
-var stateLock sync.Mutex
-
-func loadState(filename string) (GameState, error) {
-        stateLock.Lock()
-        defer stateLock.Unlock()
-
-        data, err := ioutil.ReadFile(filename)
-        if err != nil {
-                return GameState{}, err
-        }
-
-        var state GameState
-        err = json.Unmarshal(data, &state)
-        if state.Infra == nil {
-                state.Infra = make(map[string]int)
-                state.ResearchPoints = 0
-        }
-        if state.Ships == nil {
-                state.Ships = make(map[string][]*Ship)
-        }
-        return state, err
+type GameStateResponse struct {
+	MyColonies []Colony       `json:"my_colonies"`
+	WorldIndex []ColonySummary `json:"world_index"`
+	StarCoins  int            `json:"starCoins"`
+	Ticks      int            `json:"ticksPassed"`
 }
 
-func saveState(filename string, state GameState) error {
-        stateLock.Lock()
-        defer stateLock.Unlock()
+// --- Globals ---
 
-        data, err := json.MarshalIndent(state, "", "  ")
-        if err != nil {
-                return err
-        }
-        return ioutil.WriteFile(filename, data, 0644)
+var serverURL = "http://localhost:8080"
+var currentUserID = 0
+var currentUsername = ""
+
+// --- Networking ---
+
+func postAuth(endpoint, username, password string) (int, error) {
+	payload := map[string]string{"username": username, "password": password}
+	jsonPayload, _ := json.Marshal(payload)
+	
+	resp, err := http.Post(serverURL + endpoint, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil { return 0, err }
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("auth failed")
+	}
+
+	var res map[string]int
+	json.NewDecoder(resp.Body).Decode(&res)
+	return res["user_id"], nil
 }
 
-func showCommand(state GameState) {
-        fmt.Printf("Food: %d, Water: %d, Minerals: %d\n", state.FoodCount, state.WaterCount, state.MineralCount)
-        fmt.Printf("Population: %d, Happiness: %.2f%%\n", state.Population, state.Happiness)
-        fmt.Printf("Research Points: %d\n", state.ResearchPoints)
-        fmt.Printf("StarCoins: %d, TaxRate: %.2f\n", state.StarCoins, state.TaxRate)
-        fmt.Printf("Ticks Passed: %d\n", state.TicksPassed)
+func getServerState() (GameStateResponse, error) {
+	req, _ := http.NewRequest("GET", serverURL + "/state", nil)
+	req.Header.Set("X-User-ID", strconv.Itoa(currentUserID))
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil { return GameStateResponse{}, err }
+	defer resp.Body.Close()
 
-        fmt.Println("Infrastructure:")
-        for infraType, count := range state.Infra {
-                fmt.Printf("  %s: %d\n", infraType, count)
-        }
-
-        fmt.Println("Ships:")
-        for class, ships := range state.Ships {
-                fmt.Printf("Class %s:\n", class)
-                for _, ship := range ships {
-                        fmt.Printf("  %s (Level: %d, Amount: %d)\n", ship.Name, ship.Level, ship.Amount)
-                }
-        }
+	var state GameStateResponse
+	json.NewDecoder(resp.Body).Decode(&state)
+	return state, nil
 }
 
-func researchShip(state *GameState, args []string) {
-        if len(args) < 4 {
-                fmt.Println("Usage: worldc research <class> <name>")
-                os.Exit(1)
-        }
-
-        shipClass := args[2]
-        shipName := args[3]
-
-        if shipClass != "Explorite" && shipClass != "Enforcer" && shipClass != "Pioneer" {
-                fmt.Println("Unknown ship class:", shipClass)
-                return
-        }
-
-        fmt.Printf("How many StarCoins do you want to put into this research project?\n")
-        var starCoins int
-        fmt.Scan(&starCoins)
-
-        fmt.Printf("How many Development Points do you want to add to this project?\n")
-        var devPoints int
-        fmt.Scan(&devPoints)
-
-        newShip := &Ship{
-                Name:       shipName,
-                Class:      shipClass,
-                Health:     50,  // default for all
-                Level:      1,   // starting level
-                Price:      100, // base price, to be adjusted
-                FuelCapacity:    100,
-                FuelEfficiency:  1,
-                Damage:     0,
-        }
-
-        switch shipClass {
-        case "Explorite":
-                newShip.FuelCapacity += starCoins / 10
-                newShip.FuelEfficiency += float64(starCoins) / 100.0
-        case "Enforcer":
-                newShip.Damage += starCoins / 10
-        case "Pioneer":
-                newShip.PersonnelLimit += starCoins / 10
-                newShip.FuelCapacity += starCoins / 20
-                newShip.FuelEfficiency += float64(starCoins) / 200.0
-        }
-
-        priceAdjustment := devPoints * 50
-        newShip.Price = max(50, newShip.Price-priceAdjustment) // ensure there is a minimum price
-
-        state.Ships[shipClass] = append(state.Ships[shipClass], newShip)
-        saveState("../data/game_state.json", *state)
-        fmt.Printf("Research complete! Developed new ship: %s\n", newShip.Name)
-        fmt.Println("Ship Details:")
-        fmt.Printf("  Class: %s, Health: %d, Fuel Capacity: %d, Fuel Efficiency: %.2f, Damage: %d, Personnel Limit: %d, Price: %d\n",
-                newShip.Class, newShip.Health, newShip.FuelCapacity, newShip.FuelEfficiency, newShip.Damage, newShip.PersonnelLimit, newShip.Price)
+func postBuild(colonyID int, structure string) error {
+	payload := map[string]interface{}{
+		"user_id": currentUserID,
+		"colony_id": colonyID,
+		"structure": structure,
+	}
+	jsonPayload, _ := json.Marshal(payload)
+	
+	resp, err := http.Post(serverURL + "/build", "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil { return err }
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("build failed (not owner?)")
+	}
+	return nil
 }
 
-func buildInfrastructure(state *GameState, args []string) {
-        // Updated function for building infrastructure with detailed resource consumption
+// --- Menus ---
+
+func authMenu(reader *bufio.Reader) bool {
+	fmt.Println("\n=== AUTHENTICATION ===")
+	fmt.Println("1. Login")
+	fmt.Println("2. Register")
+	fmt.Println("3. Exit")
+	fmt.Print("Select: ")
+	
+	opt, _ := reader.ReadString('\n')
+	opt = strings.TrimSpace(opt)
+	
+	if opt == "3" { os.Exit(0) }
+	
+	fmt.Print("Username: ")
+	user, _ := reader.ReadString('\n')
+	user = strings.TrimSpace(user)
+	
+	fmt.Print("Password: ")
+	pass, _ := reader.ReadString('\n')
+	pass = strings.TrimSpace(pass)
+	
+	endpoint := "/login"
+	if opt == "2" { endpoint = "/register" }
+	
+	id, err := postAuth(endpoint, user, pass)
+	if err != nil {
+		fmt.Println("Authentication failed:", err)
+		return false
+	}
+	
+	currentUserID = id
+	currentUsername = user
+	fmt.Printf("Welcome, Commander %s (ID: %d)\n", user, id)
+	return true
 }
 
-func destroyInfrastructure(state *GameState, args []string) {
-        // Updated function for destroying infrastructure with detailed information
+func mainMenu() {
+	reader := bufio.NewReader(os.Stdin)
+
+	// Auth Loop
+	for currentUserID == 0 {
+		if !authMenu(reader) {
+			time.Sleep(1 * time.Second)
+		}
+	}
+
+	for {
+		state, err := getServerState()
+		if err != nil {
+			fmt.Println("Connection lost:", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		fmt.Println("\n=== COMMAND CENTER ===")
+		fmt.Printf("User: %s | Ticks: %d\n", currentUsername, state.Ticks)
+		fmt.Println("--------------------------")
+		fmt.Println("1. My Colonies")
+		fmt.Println("2. World Index (Map)")
+		fmt.Println("3. Refresh")
+		fmt.Println("4. Logout")
+		fmt.Print("Select: ")
+
+		input, _ := reader.ReadString('\n')
+		switch strings.TrimSpace(input) {
+		case "1":
+			myColoniesMenu(reader, state)
+		case "2":
+			worldIndexMenu(state)
+		case "3":
+			continue
+		case "4":
+			currentUserID = 0
+			mainMenu() // Recursively restart to auth
+		}
+	}
 }
 
-func constructShip(state *GameState, args []string) {
-        // Updated function for managing ship construction
+func myColoniesMenu(reader *bufio.Reader, state GameStateResponse) {
+	fmt.Println("\n--- MY COLONIES ---")
+	if len(state.MyColonies) == 0 {
+		fmt.Println("No colonies found.")
+		return
+	}
+	
+	for i, c := range state.MyColonies {
+		fmt.Printf("%d. %s [Pop: %d | Food: %d]\n", i+1, c.Name, c.Pop, c.Food)
+	}
+	fmt.Println("B. Build")
+	fmt.Println("R. Return")
+	
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(strings.ToUpper(input))
+	
+	if input == "B" {
+		fmt.Print("Colony # to build in: ")
+		numStr, _ := reader.ReadString('\n')
+		num, _ := strconv.Atoi(strings.TrimSpace(numStr))
+		if num > 0 && num <= len(state.MyColonies) {
+			col := state.MyColonies[num-1]
+			fmt.Print("Structure (farm/well): ")
+			str, _ := reader.ReadString('\n')
+			postBuild(col.ID, strings.TrimSpace(str))
+		}
+	}
 }
 
-func setCommand(state *GameState, args []string) {
-        // Updated function for setting parameters such as TaxRate
-}
-
-func max(a, b int) int {
-        if a > b {
-                return a
-        }
-        return b
-}
-
-func showHelp() {
-        fmt.Println("Usage: worldc <command> [args]")
-        fmt.Println("Commands:")
-        fmt.Println("  show                                  - Display the current game state.")
-        fmt.Println("  build <infrastructure> <number>       - Build specified amount of infrastructure.")
-        fmt.Println("  destroy <infrastructure> <number>     - Destroy specified amount of infrastructure.")
-        fmt.Println("  set <TaxRate> <value>                 - Set the tax rate.")
-        fmt.Println("  construct <ship_class> <number>       - Construct specified amount of ships based on class.")
-        fmt.Println("  research <class> <name>               - Start a new research project for a ship.")
-}
-
-func executeCommand(command string, state *GameState, args []string) {
-        switch command {
-        case "show":
-                showCommand(*state)
-        case "build":
-                buildInfrastructure(state, args)
-        case "destroy":
-                destroyInfrastructure(state, args)
-        case "set":
-                setCommand(state, args)
-        case "construct":
-                constructShip(state, args)
-        case "research":
-                researchShip(state, args)
-        default:
-                showHelp()
-        }
+func worldIndexMenu(state GameStateResponse) {
+	fmt.Println("\n--- WORLD INDEX ---")
+	for _, c := range state.WorldIndex {
+		fmt.Printf("- %s (Owner: %s) @ %v\n", c.Name, c.OwnerName, c.Location)
+	}
+	fmt.Println("(Press Enter to return)")
+	bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
 func main() {
-        if len(os.Args) < 2 {
-                showHelp()
-                os.Exit(1)
-        }
+	urlPtr := flag.String("server", "http://localhost:8080", "Server URL")
+	flag.Parse()
+	serverURL = *urlPtr
 
-        command := os.Args[1]
-        filename := "../data/game_state.json"
-
-        state, err := loadState(filename)
-        if err != nil {
-                fmt.Printf("Error loading state: %v\n", err)
-                return
-        }
-
-        executeCommand(command, &state, os.Args)
-
-        if command == "build" || command == "destroy" || command == "set" || command == "construct" || command == "research" {
-                if err := saveState(filename, state); err != nil {
-                        fmt.Printf("Error saving state: %v\n", err)
-                }
-        }
+	fmt.Println("Connecting to", serverURL)
+	mainMenu()
 }
