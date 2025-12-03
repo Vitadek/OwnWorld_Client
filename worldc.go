@@ -4,220 +4,193 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 )
 
-// --- Structs ---
+var ServerURL = "http://localhost:8080"
 
-type Colony struct {
-	ID        int            `json:"id"`
-	Name      string         `json:"name"`
-	Location  []int          `json:"location"`
-	Buildings map[string]int `json:"buildings"`
-	Food      int            `json:"food"`
-	Water     int            `json:"water"`
-	Pop       int            `json:"population"`
+// --- Models ---
+type RegisterResponse struct {
+	UserID   int    `json:"user_id"`
+	SystemID string `json:"system_id"`
+	Status   string `json:"status"`
 }
 
-type ColonySummary struct {
-	Name      string `json:"name"`
-	OwnerName string `json:"owner_name"`
-	Location  []int  `json:"location"`
-}
-
-type GameStateResponse struct {
-	MyColonies []Colony       `json:"my_colonies"`
-	WorldIndex []ColonySummary `json:"world_index"`
-	StarCoins  int            `json:"starCoins"`
-	Ticks      int            `json:"ticksPassed"`
-}
-
-// --- Globals ---
-
-var serverURL = "http://localhost:8080"
-var currentUserID = 0
-var currentUsername = ""
-
-// --- Networking ---
-
-func postAuth(endpoint, username, password string) (int, error) {
-	payload := map[string]string{"username": username, "password": password}
-	jsonPayload, _ := json.Marshal(payload)
-	
-	resp, err := http.Post(serverURL + endpoint, "application/json", bytes.NewBuffer(jsonPayload))
-	if err != nil { return 0, err }
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return 0, fmt.Errorf("auth failed")
-	}
-
-	var res map[string]int
-	json.NewDecoder(resp.Body).Decode(&res)
-	return res["user_id"], nil
-}
-
-func getServerState() (GameStateResponse, error) {
-	req, _ := http.NewRequest("GET", serverURL + "/state", nil)
-	req.Header.Set("X-User-ID", strconv.Itoa(currentUserID))
-	
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil { return GameStateResponse{}, err }
-	defer resp.Body.Close()
-
-	var state GameStateResponse
-	json.NewDecoder(resp.Body).Decode(&state)
-	return state, nil
-}
-
-func postBuild(colonyID int, structure string) error {
-	payload := map[string]interface{}{
-		"user_id": currentUserID,
-		"colony_id": colonyID,
-		"structure": structure,
-	}
-	jsonPayload, _ := json.Marshal(payload)
-	
-	resp, err := http.Post(serverURL + "/build", "application/json", bytes.NewBuffer(jsonPayload))
-	if err != nil { return err }
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("build failed (not owner?)")
-	}
-	return nil
-}
-
-// --- Menus ---
-
-func authMenu(reader *bufio.Reader) bool {
-	fmt.Println("\n=== AUTHENTICATION ===")
-	fmt.Println("1. Login")
-	fmt.Println("2. Register")
-	fmt.Println("3. Exit")
-	fmt.Print("Select: ")
-	
-	opt, _ := reader.ReadString('\n')
-	opt = strings.TrimSpace(opt)
-	
-	if opt == "3" { os.Exit(0) }
-	
-	fmt.Print("Username: ")
-	user, _ := reader.ReadString('\n')
-	user = strings.TrimSpace(user)
-	
-	fmt.Print("Password: ")
-	pass, _ := reader.ReadString('\n')
-	pass = strings.TrimSpace(pass)
-	
-	endpoint := "/login"
-	if opt == "2" { endpoint = "/register" }
-	
-	id, err := postAuth(endpoint, user, pass)
-	if err != nil {
-		fmt.Println("Authentication failed:", err)
-		return false
-	}
-	
-	currentUserID = id
-	currentUsername = user
-	fmt.Printf("Welcome, Commander %s (ID: %d)\n", user, id)
-	return true
-}
-
-func mainMenu() {
-	reader := bufio.NewReader(os.Stdin)
-
-	// Auth Loop
-	for currentUserID == 0 {
-		if !authMenu(reader) {
-			time.Sleep(1 * time.Second)
-		}
-	}
-
-	for {
-		state, err := getServerState()
-		if err != nil {
-			fmt.Println("Connection lost:", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		fmt.Println("\n=== COMMAND CENTER ===")
-		fmt.Printf("User: %s | Ticks: %d\n", currentUsername, state.Ticks)
-		fmt.Println("--------------------------")
-		fmt.Println("1. My Colonies")
-		fmt.Println("2. World Index (Map)")
-		fmt.Println("3. Refresh")
-		fmt.Println("4. Logout")
-		fmt.Print("Select: ")
-
-		input, _ := reader.ReadString('\n')
-		switch strings.TrimSpace(input) {
-		case "1":
-			myColoniesMenu(reader, state)
-		case "2":
-			worldIndexMenu(state)
-		case "3":
-			continue
-		case "4":
-			currentUserID = 0
-			mainMenu() // Recursively restart to auth
-		}
-	}
-}
-
-func myColoniesMenu(reader *bufio.Reader, state GameStateResponse) {
-	fmt.Println("\n--- MY COLONIES ---")
-	if len(state.MyColonies) == 0 {
-		fmt.Println("No colonies found.")
-		return
-	}
-	
-	for i, c := range state.MyColonies {
-		fmt.Printf("%d. %s [Pop: %d | Food: %d]\n", i+1, c.Name, c.Pop, c.Food)
-	}
-	fmt.Println("B. Build")
-	fmt.Println("R. Return")
-	
-	input, _ := reader.ReadString('\n')
-	input = strings.TrimSpace(strings.ToUpper(input))
-	
-	if input == "B" {
-		fmt.Print("Colony # to build in: ")
-		numStr, _ := reader.ReadString('\n')
-		num, _ := strconv.Atoi(strings.TrimSpace(numStr))
-		if num > 0 && num <= len(state.MyColonies) {
-			col := state.MyColonies[num-1]
-			fmt.Print("Structure (farm/well): ")
-			str, _ := reader.ReadString('\n')
-			postBuild(col.ID, strings.TrimSpace(str))
-		}
-	}
-}
-
-func worldIndexMenu(state GameStateResponse) {
-	fmt.Println("\n--- WORLD INDEX ---")
-	for _, c := range state.WorldIndex {
-		fmt.Printf("- %s (Owner: %s) @ %v\n", c.Name, c.OwnerName, c.Location)
-	}
-	fmt.Println("(Press Enter to return)")
-	bufio.NewReader(os.Stdin).ReadString('\n')
+type StatusResponse struct {
+	UUID   string `json:"uuid"`
+	Tick   int    `json:"tick"`
+	Leader string `json:"leader"`
 }
 
 func main() {
-	urlPtr := flag.String("server", "http://localhost:8080", "Server URL")
-	flag.Parse()
-	serverURL = *urlPtr
+	if url := os.Getenv("OWNWORLD_SERVER"); url != "" {
+		ServerURL = url
+	}
 
-	fmt.Println("Connecting to", serverURL)
-	mainMenu()
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("OwnWorld Federation Client v2.1")
+	fmt.Printf("Connected to: %s\n", ServerURL)
+	fmt.Println("Commands: register, status, build, burn, launch, quit")
+
+	for {
+		fmt.Print("> ")
+		text, _ := reader.ReadString('\n')
+		text = strings.TrimSpace(text)
+		parts := strings.Fields(text)
+
+		if len(parts) == 0 {
+			continue
+		}
+
+		cmd := parts[0]
+
+		switch cmd {
+		case "status":
+			doStatus()
+		case "register":
+			if len(parts) < 3 {
+				fmt.Println("Usage: register <username> <password>")
+				continue
+			}
+			doRegister(parts[1], parts[2])
+		case "build":
+			if len(parts) < 4 {
+				fmt.Println("Usage: build <colony_id> <structure> <amount>")
+				continue
+			}
+			amt, _ := strconv.Atoi(parts[3])
+			colID, _ := strconv.Atoi(parts[1])
+			doBuild(colID, parts[2], amt)
+		case "burn":
+			if len(parts) < 4 {
+				fmt.Println("Usage: burn <colony_id> <item> <amount>")
+				continue
+			}
+			amt, _ := strconv.Atoi(parts[3])
+			colID, _ := strconv.Atoi(parts[1])
+			doBurn(colID, parts[2], amt)
+		case "launch":
+			// New Feature from v1 Client
+			if len(parts) < 4 {
+				fmt.Println("Usage: launch <fleet_id> <dest_system_uuid> <distance>")
+				continue
+			}
+			fleetID, _ := strconv.Atoi(parts[1])
+			dist, _ := strconv.Atoi(parts[3])
+			doLaunch(fleetID, parts[2], dist)
+		case "quit", "exit":
+			fmt.Println("Disconnecting...")
+			os.Exit(0)
+		default:
+			fmt.Println("Unknown command.")
+		}
+	}
+}
+
+func doStatus() {
+	resp, err := http.Get(ServerURL + "/api/status")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	
+	var s StatusResponse
+	json.Unmarshal(body, &s)
+	// Safety check for empty response
+	if s.Leader == "" { s.Leader = "Unknown" }
+	if s.UUID == "" { s.UUID = "Unknown" }
+	
+	// Truncate UUIDs for display if they are long enough
+	leaderDisp := s.Leader
+	if len(s.Leader) > 8 { leaderDisp = s.Leader[:8] }
+	uuidDisp := s.UUID
+	if len(s.UUID) > 8 { uuidDisp = s.UUID[:8] }
+
+	fmt.Printf("Tick: %d | Leader: %s | UUID: %s\n", s.Tick, leaderDisp, uuidDisp)
+}
+
+func doRegister(user, pass string) {
+	payload := map[string]string{"username": user, "password": pass}
+	data, _ := json.Marshal(payload)
+	
+	resp, err := http.Post(ServerURL+"/api/register", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		fmt.Printf("Connection Error: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		fmt.Printf("Failed: %s\n", string(body))
+		return
+	}
+
+	var r RegisterResponse
+	json.Unmarshal(body, &r)
+	fmt.Printf("Success! User ID: %d, System: %s\n", r.UserID, r.SystemID)
+}
+
+func doBuild(colID int, structure string, amount int) {
+	payload := map[string]interface{}{
+		"colony_id": colID,
+		"structure": structure,
+		"amount":    amount,
+	}
+	data, _ := json.Marshal(payload)
+
+	resp, err := http.Post(ServerURL+"/api/build", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("Response: %s\n", string(body))
+}
+
+func doBurn(colID int, item string, amount int) {
+	payload := map[string]interface{}{
+		"colony_id": colID,
+		"item":      item,
+		"amount":    amount,
+	}
+	data, _ := json.Marshal(payload)
+
+	resp, err := http.Post(ServerURL+"/api/bank/burn", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("Bank Receipt: %s\n", string(body))
+}
+
+func doLaunch(fleetID int, dest string, distance int) {
+	payload := map[string]interface{}{
+		"fleet_id":    fleetID,
+		"dest_system": dest,
+		"distance":    distance,
+	}
+	data, _ := json.Marshal(payload)
+
+	resp, err := http.Post(ServerURL+"/api/fleet/launch", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("Mission Status: %s\n", string(body))
 }
